@@ -1,22 +1,33 @@
-using Microsoft.PowerPlatform.Dataverse.Client;
-using Microsoft.Xrm.Sdk;
-
 namespace CrmSolutionExporter
 {
     internal class MainFormEventHandlers
     {
         private readonly MainForm form;
         private readonly MainFormComponents components;
-        private ServiceClient? serviceClient;
-        private List<Entity> allSolutions;
+        private bool isConnected;
+        private List<SolutionInfo> allSolutions;
+        private DateTime? pacAuthTime;
+        private static readonly TimeSpan PacAuthLifetime = TimeSpan.FromMinutes(50);
+
+        private bool IsPacAuthExpired => pacAuthTime == null || DateTime.UtcNow - pacAuthTime.Value > PacAuthLifetime;
 
         public MainFormEventHandlers(MainForm form, MainFormComponents components)
         {
             this.form = form;
             this.components = components;
 
-            allSolutions = new List<Entity>();
+            allSolutions = new List<SolutionInfo>();
+            LoadUserSettings();
             ConnectEventHandlers();
+        }
+
+        private void LoadUserSettings()
+        {
+            var settings = UserSettings.Load();
+            if (!string.IsNullOrEmpty(settings.ServerUrl))
+                components.TxtServerUrl.Text = settings.ServerUrl;
+            if (!string.IsNullOrEmpty(settings.GitRepoPath))
+                components.TxtSolutionPath.Text = settings.GitRepoPath;
         }
 
         private void ConnectEventHandlers()
@@ -101,16 +112,16 @@ namespace CrmSolutionExporter
                 if (string.IsNullOrEmpty(filterText))
                     return true;
 
-                var uniqueName = s.GetAttributeValue<string>("uniquename")?.ToLower() ?? "";
-                var friendlyName = s.GetAttributeValue<string>("friendlyname")?.ToLower() ?? "";
+                var uniqueName = s.UniqueName?.ToLower() ?? "";
+                var friendlyName = s.FriendlyName?.ToLower() ?? "";
 
                 return uniqueName.Contains(filterText) || friendlyName.Contains(filterText);
             });
 
             foreach (var solution in filteredSolutions)
             {
-                var uniqueName = solution.GetAttributeValue<string>("uniquename");
-                var friendlyName = solution.GetAttributeValue<string>("friendlyname");
+                var uniqueName = solution.UniqueName;
+                var friendlyName = solution.FriendlyName;
                 var displayText = $"{uniqueName} ({friendlyName})";
 
                 var index = components.LstSolutions.Items.Add(displayText);
@@ -143,27 +154,29 @@ namespace CrmSolutionExporter
             components.BtnExport.Enabled = false;
             components.LstSolutions.Items.Clear();
 
-            this.Log("Connecting to CRM organization...");
+            this.Log("Connecting...");
 
             try
             {
-                await Task.Run(() =>
-                {
-                    serviceClient = DataverseActions.ConnectToDataverse(components.TxtServerUrl.Text);
-                });
+                this.Log("Checking .NET installation...");
+                DataverseActions.CheckDotNetInstallation(this.Log);
 
-                if (serviceClient == null || !serviceClient.IsReady)
-                {
-                    this.Log($"Failed to connect: {serviceClient?.LastError}");
-                    MessageBox.Show("Failed to connect to CRM organization.", "Connection Error",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
-                }
+                this.Log("Ensuring PAC CLI is installed...");
+                await DataverseActions.EnsurePacCliInstalled(this.Log);
 
-                this.Log("Successfully connected!");
+                await DataverseActions.AuthenticatePacCli(components.TxtServerUrl.Text, this.Log);
+                pacAuthTime = DateTime.UtcNow;
+
+                new UserSettings
+                {
+                    ServerUrl = components.TxtServerUrl.Text,
+                    GitRepoPath = components.TxtSolutionPath.Text
+                }.Save();
+
                 this.Log("Retrieving solutions...");
 
-                allSolutions = await Task.Run(() => DataverseActions.GetUnmanagedSolutions(serviceClient));
+                allSolutions = await DataverseActions.GetUnmanagedSolutions(this.Log);
+                isConnected = true;
 
                 this.Log($"Found {allSolutions.Count} unmanaged solutions.");
 
@@ -187,9 +200,9 @@ namespace CrmSolutionExporter
 
         public async void BtnExport_Click(object? sender, EventArgs e)
         {
-            if (serviceClient == null || !serviceClient.IsReady)
+            if (!isConnected)
             {
-                MessageBox.Show("Please connect to CRM first.", "Validation Error",
+                MessageBox.Show("Please connect first.", "Validation Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
@@ -198,8 +211,7 @@ namespace CrmSolutionExporter
 
             if (components.ChkAllSolutions.Checked)
             {
-                selectedSolutions.AddRange(allSolutions.Select(s =>
-                    s.GetAttributeValue<string>("uniquename")));
+                selectedSolutions.AddRange(allSolutions.Select(s => s.UniqueName));
             }
             else
             {
@@ -228,37 +240,85 @@ namespace CrmSolutionExporter
             components.BtnExport.Enabled = false;
             components.BtnConnect.Enabled = false;
             components.ProgressBar.Visible = true;
-            components.ProgressBar.Maximum = selectedSolutions.Count * 2; // Managed + Unmanaged
+            components.ProgressBar.Maximum = selectedSolutions.Count * 3; // Export managed + unmanaged + unpack/copy
             components.ProgressBar.Value = 0;
+
+            string? tempDir = null;
 
             try
             {
-                var solutionPath = components.TxtSolutionPath.Text;
-                DataverseActions.EnsureDirectoryExists(solutionPath);
-                var exportPath = System.IO.Path.Combine(solutionPath, "Export");
-                DataverseActions.EnsureDirectoryExists(exportPath);
+                var repoPath = components.TxtSolutionPath.Text;
+                var repoSolutionsPath = System.IO.Path.Combine(repoPath, "Solutions");
+
+                if (!Directory.Exists(repoSolutionsPath))
+                {
+                    MessageBox.Show($"Solutions folder not found at:\n{repoSolutionsPath}\n\nPlease ensure the path points to a valid repository clone.",
+                        "Invalid Repository Path", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                tempDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"DVCWinExporter_{Guid.NewGuid():N}");
+                Directory.CreateDirectory(tempDir);
+                var tempUnpackDir = System.IO.Path.Combine(tempDir, "Unpacked");
+                Directory.CreateDirectory(tempUnpackDir);
+
+                this.Log($"Using temp folder: {tempDir}");
 
                 foreach (var solutionName in selectedSolutions)
                 {
                     this.Log($"Exporting {solutionName} (unmanaged)...");
-                    await Task.Run(() => DataverseActions.ExportSolution(serviceClient, solutionName, solutionPath, false, this.Log));
+                    await DataverseActions.ExportSolution(solutionName, tempDir, false, this.Log);
                     components.ProgressBar.Value++;
 
                     this.Log($"Exporting {solutionName} (managed)...");
-                    await Task.Run(() => DataverseActions.ExportSolution(serviceClient, solutionName, solutionPath, true, this.Log));
+                    await DataverseActions.ExportSolution(solutionName, tempDir, true, this.Log);
                     components.ProgressBar.Value++;
                 }
 
-                this.Log("Checking .NET installation...");
-                DataverseActions.CheckDotNetInstallation(this.Log);
+                if (IsPacAuthExpired)
+                {
+                    this.Log("PAC CLI token expired, re-authenticating...");
+                    await DataverseActions.AuthenticatePacCli(components.TxtServerUrl.Text, this.Log);
+                    pacAuthTime = DateTime.UtcNow;
+                }
 
-                this.Log("Ensuring PAC CLI is installed...");
-                await DataverseActions.EnsurePacCliInstalled(this.Log);
-
-                // Unpack solutions
+                // Unpack and copy to repository
                 foreach (var solutionName in selectedSolutions)
                 {
-                    await DataverseActions.UnpackSolution(solutionName, solutionPath, exportPath, this.Log);
+                    var repoSolutionDir = System.IO.Path.Combine(repoSolutionsPath, solutionName);
+                    if (!Directory.Exists(repoSolutionDir))
+                    {
+                        this.Log($"Skipping {solutionName} — no matching folder in repository.");
+                        components.ProgressBar.Value++;
+                        continue;
+                    }
+
+                    var repoContentDir = System.IO.Path.Combine(repoSolutionDir, solutionName);
+                    if (Directory.Exists(repoContentDir))
+                    {
+                        var result = MessageBox.Show(
+                            $"The solution '{solutionName}' already has content in the repository at:\n{repoContentDir}\n\nDo you want to overwrite it?",
+                            "Overwrite Solution Content",
+                            MessageBoxButtons.YesNoCancel,
+                            MessageBoxIcon.Question);
+
+                        if (result == DialogResult.Cancel)
+                        {
+                            this.Log("Export cancelled by user.");
+                            break;
+                        }
+
+                        if (result == DialogResult.No)
+                        {
+                            this.Log($"Skipping {solutionName} (not overwriting).");
+                            components.ProgressBar.Value++;
+                            continue;
+                        }
+                    }
+
+                    await DataverseActions.UnpackSolution(solutionName, tempDir, tempUnpackDir, this.Log);
+                    DataverseActions.CopySolutionToRepository(solutionName, tempUnpackDir, repoSolutionsPath, this.Log);
+                    components.ProgressBar.Value++;
                 }
 
                 this.Log("Export completed successfully!");
@@ -273,6 +333,10 @@ namespace CrmSolutionExporter
             }
             finally
             {
+                if (tempDir != null && Directory.Exists(tempDir))
+                {
+                    try { Directory.Delete(tempDir, true); } catch { }
+                }
                 components.ProgressBar.Visible = false;
                 components.BtnExport.Enabled = true;
                 components.BtnConnect.Enabled = true;

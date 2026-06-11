@@ -58,10 +58,10 @@ namespace CrmSolutionExporter
             
             form.Controls.Add(BtnConnect);
 
-            // Export Path
+            // Git Repo Path
             var lblSolutionPath = new Label
             {
-                Text = "Export Path:",
+                Text = "Git Repo Path:",
                 Location = new Point(20, 60),
                 Size = new Size(100, 20)
             };

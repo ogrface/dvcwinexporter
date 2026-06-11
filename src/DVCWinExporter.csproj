@@ -6,8 +6,23 @@
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Assembly / Publisher metadata -->
+    <AssemblyName>DVCWinExporter</AssemblyName>
+    <Product>DVCWinExporter</Product>
+    <Company>Medical Solutions</Company>
+    <Authors>Medical Solutions</Authors>
+    <Description>Dataverse Solution Exporter</Description>
+    <Copyright>Copyright © Medical Solutions 2026</Copyright>
+    <Version>1.0.0</Version>
+
+    <!-- Publish as single-file, self-contained for easy distribution -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+
+    <!-- Strong-name signing -->
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>DVCWinExporter.snk</AssemblyOriginatorKeyFile>
   </PropertyGroup>
-  <ItemGroup>
-    <PackageReference Include="Microsoft.PowerPlatform.Dataverse.Client" Version="1.1.*" />
-  </ItemGroup>
 </Project>
